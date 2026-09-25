@@ -38,6 +38,7 @@ from ..basetypes import (
     NotificationParameters,
     NotificationParametersChangeOfReliabilityType,
     NotificationParametersChangeOfState,
+    NotificationParametersCommandFailure,
     NotificationParametersOutOfRange,
     ObjectPropertyReference,
     OptionalCharacterString,
@@ -96,6 +97,7 @@ from ..apdu import (
 from .object import (
     Algorithm,
     Object,
+    Parameter,
 )
 from .fault import FaultAlgorithm, OutOfRangeFaultAlgorithm
 
@@ -423,6 +425,19 @@ class EventAlgorithm(Algorithm, DebugContents):
         self._transition_state = None
         self._transition_timeout_handle.cancel()
         self._transition_timeout_handle = None
+
+    def object_deleted(self, obj: Object) -> None:
+        """
+        This method is called when an object of the application has been
+        deleted so that a transition scheduled before the deletion does
+        not fire for an object that no longer exists.
+        """
+        if _debug:
+            EventAlgorithm._debug("object_deleted %r", obj)
+
+        if (obj is self.monitored_object) or (obj is self.monitoring_object):
+            if self._transition_timeout_handle:
+                self.state_transition_cancel()
 
     def state_transition(
         self, new_state: Optional[EventState], immediate: bool = False
@@ -1190,6 +1205,8 @@ class CommandFailureEventAlgorithm(EventAlgorithm):
     pTimeDelay: Unsigned
     pTimeDelayNormal: Unsigned
 
+    _feedback_object: Optional[Object]
+
     def __init__(
         self,
         monitoring_object: Optional[EventEnrollmentObject],
@@ -1199,17 +1216,13 @@ class CommandFailureEventAlgorithm(EventAlgorithm):
             CommandFailureEventAlgorithm._debug("__init__ %r", monitored_object)
         super().__init__(monitoring_object, monitored_object)
 
+        # object referenced for feedback values, if there is one
+        self._feedback_object = None
+
         if monitoring_object:
-            fpr: DeviceObjectPropertyReference = (
-                monitoring_object.eventParameters.commandFailure.feedbackPropertyReference
-            )
-
-            # resolve the fpr.objectIdentifier to point to an object
-            fpr_object: Optional[Object] = None
-
-            # fpr.propertyIdentifier used below
-            # fpr.propertyArrayIndex not supported, simple properties only
-            # fpr.deviceIdentifier not supported, this device only
+            # resolve the feedback property reference and bind pFeedbackValue
+            # to it, the reference may point to another object of this device
+            self._bind_feedback_reference()
 
             # algorithmic reporting
             self.bind(
@@ -1219,9 +1232,14 @@ class CommandFailureEventAlgorithm(EventAlgorithm):
                     monitoring_object.objectPropertyReference.propertyIdentifier,
                 ),
                 pStatusFlags=(monitored_object, "statusFlags"),
-                pFeedbackValue=(fpr_object, fpr.propertyIdentifier),
                 pTimeDelay=monitoring_object.eventParameters.commandFailure.timeDelay,
                 pTimeDelayNormal=None,
+            )
+
+            # watch for configuration changes so that a transition scheduled
+            # under the old configuration does not fire
+            monitoring_object._property_monitors["eventParameters"].append(
+                self._event_parameters_change
             )
         else:
             # intrinsic reporting
@@ -1234,10 +1252,244 @@ class CommandFailureEventAlgorithm(EventAlgorithm):
                 pTimeDelayNormal=(monitored_object, "timeDelayNormal"),
             )
 
+        # watch for out-of-service changes so that a pending transition
+        # evaluated under the previous service state does not fire
+        if "outOfService" in monitored_object._elements:
+            monitored_object._property_monitors["outOfService"].append(
+                self._out_of_service_change
+            )
+
+    def init(self):
+        if _debug:
+            CommandFailureEventAlgorithm._debug(
+                "init(%s)", self.monitored_object.objectName
+            )
+
+        # now that all of the parameters are bound, reflect the validity of
+        # the feedback reference in the reliability
+        if self.monitoring_object is not None:
+            self._update_reference_reliability()
+
+    def _bind_feedback_reference(self) -> None:
+        """
+        (Re)resolve the feedback property reference of the event parameters
+        and bind pFeedbackValue to it.  If the reference cannot be resolved
+        the pFeedbackValue parameter is left unbound.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug("_bind_feedback_reference")
+
+        monitoring_object = self.monitoring_object
+
+        # detach the old feedback parameter if there is one
+        old_parameter = self._parameters.pop("pFeedbackValue", None)
+        if (old_parameter is not None) and old_parameter.listen:
+            old_parameter.obj._property_monitors[
+                old_parameter.property_identifier
+            ].remove(old_parameter.property_change)
+
+        self._feedback_object = None
+
+        fpr: DeviceObjectPropertyReference = (
+            monitoring_object.eventParameters.commandFailure.feedbackPropertyReference
+        )
+        if _debug:
+            CommandFailureEventAlgorithm._debug("    - fpr: %r", fpr)
+
+        # resolve the fpr.objectIdentifier to point to an object, references
+        # to other devices and array elements are not supported
+        feedback_object: Optional[Object] = None
+        if (
+            (fpr.deviceIdentifier is None)
+            and (fpr.propertyArrayIndex is None)
+            and (monitoring_object._app is not None)
+        ):
+            feedback_object = monitoring_object._app.get_object_id(fpr.objectIdentifier)
+        if _debug:
+            CommandFailureEventAlgorithm._debug(
+                "    - feedback_object: %r", feedback_object
+            )
+
+        # bind the parameter to the feedback object property
+        if feedback_object is not None:
+            try:
+                parameter = Parameter(
+                    self, "pFeedbackValue", feedback_object, fpr.propertyIdentifier
+                )
+            except ValueError:
+                parameter = None
+            if parameter is not None:
+                self._parameters["pFeedbackValue"] = parameter
+                self._feedback_object = feedback_object
+
+        # if the algorithm is already bound reflect the validity of the
+        # reference in the reliability, otherwise init() will do it
+        if "pCurrentReliability" in self._parameters:
+            self._update_reference_reliability()
+
+    def _update_reference_reliability(self) -> None:
+        """
+        Set the reliability of the config object to reflect whether or not
+        the feedback reference could be resolved.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug("_update_reference_reliability")
+
+        config_object = self.monitoring_object
+        if "pFeedbackValue" in self._parameters:
+            if config_object.reliability == Reliability.configurationError:
+                config_object.reliability = Reliability.noFaultDetected
+        else:
+            if config_object.reliability != Reliability.configurationError:
+                config_object.reliability = Reliability.configurationError
+
+    def _schedule_execute(self) -> None:
+        """
+        Schedule the algorithm to run again, like a parameter monitor would.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug("_schedule_execute")
+
+        if self._execute_handle is None:
+            self._execute_handle = asyncio.get_event_loop().call_soon(self._execute)
+
+    def _event_parameters_change(self, old_value, new_value) -> None:
+        """
+        This method is called when the event parameters of the monitoring
+        object have changed, such as a different feedback reference or time
+        delay.  A transition scheduled under the old configuration must not
+        fire.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug(
+                "_event_parameters_change %r %r", old_value, new_value
+            )
+
+        # cancel a pending transition scheduled with the old parameters
+        if self._transition_timeout_handle:
+            self.state_transition_cancel()
+
+        # update the time delay
+        self.pTimeDelay = new_value.commandFailure.timeDelay
+
+        # the feedback reference may have changed
+        self._bind_feedback_reference()
+
+        # evaluate again with the new configuration
+        self._schedule_execute()
+
+    def _out_of_service_change(self, old_value, new_value) -> None:
+        """
+        This method is called when the monitored object changes its
+        out-of-service state.  A transition pending from the previous
+        service state must not fire.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug(
+                "_out_of_service_change %r %r", old_value, new_value
+            )
+
+        # cancel a pending transition and evaluate again
+        if self._transition_timeout_handle:
+            self.state_transition_cancel()
+        self._schedule_execute()
+
+    def object_deleted(self, obj: Object) -> None:
+        """
+        This method is called when an object of the application has been
+        deleted.  In addition to the base behavior, if the deleted object
+        was referenced for feedback values the reference is no longer valid.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug("object_deleted %r", obj)
+        super().object_deleted(obj)
+
+        if obj is self._feedback_object:
+            self._bind_feedback_reference()
+            self._schedule_execute()
+
     def execute(self):
         if _debug:
             CommandFailureEventAlgorithm._debug("execute")
-        raise NotImplementedError("COMMAND_FAILURE not implemented")
+            CommandFailureEventAlgorithm._debug(
+                "    - current state: %r", self._current_state
+            )
+
+        # if the timing configuration changed, a pending transition was
+        # scheduled with stale parameters; cancel it and re-evaluate
+        if ("pTimeDelay" in self._what_changed) or (
+            "pTimeDelayNormal" in self._what_changed
+        ):
+            if self._transition_timeout_handle:
+                self.state_transition_cancel()
+
+        # extract some parameter values
+        monitored_value: Atomic = self.pMonitoredValue
+        feedback_value: Optional[Atomic] = getattr(self, "pFeedbackValue", None)
+        if _debug:
+            CommandFailureEventAlgorithm._debug(
+                "    - monitored_value, feedback_value: %r, %r",
+                monitored_value,
+                feedback_value,
+            )
+
+        if feedback_value is None:
+            # the feedback reference is invalid, the reliability reflects
+            # the configuration problem and no evaluation is possible
+            if _debug:
+                CommandFailureEventAlgorithm._debug("    - no feedback value")
+            self.state_transition(None)
+            return
+
+        """
+        (a) If pCurrentState is NORMAL, and pMonitoredValue is not equal to
+        pFeedbackValue for pTimeDelay, then indicate a transition to the
+        OFFNORMAL event state.
+        """
+        if (self._current_state == EventState.normal) and (
+            monitored_value != feedback_value
+        ):
+            if _debug:
+                CommandFailureEventAlgorithm._debug("    - (a)")
+            self.state_transition(EventState.offnormal)
+            return
+
+        """
+        (b) If pCurrentState is OFFNORMAL, and pMonitoredValue is equal to
+        pFeedbackValue for pTimeDelayNormal, then indicate a transition to
+        the NORMAL event state.
+        """
+        if (self._current_state == EventState.offnormal) and (
+            monitored_value == feedback_value
+        ):
+            if _debug:
+                CommandFailureEventAlgorithm._debug("    - (b)")
+            self.state_transition(EventState.normal)
+            return
+
+        if _debug:
+            CommandFailureEventAlgorithm._debug("    - (x)")
+        self.state_transition(None)
+
+    def event_notification_parameters(self) -> NotificationParameters:
+        """
+        Return the notification parameters for to/from offnormal states.
+        The command value and feedback value are the values at the time the
+        transition is triggered.
+        """
+        if _debug:
+            CommandFailureEventAlgorithm._debug("event_notification_parameters")
+
+        command_value = Any(self.pMonitoredValue)
+        feedback_value = Any(self.pFeedbackValue)
+
+        return NotificationParameters(
+            commandFailure=NotificationParametersCommandFailure(
+                commandValue=command_value,
+                statusFlags=self.pStatusFlags,
+                feedbackValue=feedback_value,
+            ),
+        )
 
 
 #
@@ -2467,6 +2719,10 @@ class EventEnrollmentObject(Object, _EventEnrollmentObject):
             )
         elif event_type == EventType.changeOfState:
             self._event_algorithm = ChangeOfStateEventAlgorithm(
+                self, self._monitored_object
+            )
+        elif event_type == EventType.commandFailure:
+            self._event_algorithm = CommandFailureEventAlgorithm(
                 self, self._monitored_object
             )
         else:

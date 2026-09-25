@@ -718,6 +718,18 @@ class Application(
         # let the object knows it's no longer associated with an application
         obj._app = None
 
+        # let the event algorithm of the deleted object (if there is one)
+        # and the event algorithms of the remaining objects know that this
+        # object is gone so pending transitions do not fire
+        obj_event_algorithm = getattr(obj, "_event_algorithm", None)
+        if obj_event_algorithm is not None:
+            obj_event_algorithm.object_deleted(obj)
+
+        for remaining_obj in self.objectIdentifier.values():
+            event_algorithm = getattr(remaining_obj, "_event_algorithm", None)
+            if event_algorithm is not None:
+                event_algorithm.object_deleted(obj)
+
         if isinstance(obj, NetworkPortObject):
             link_layer = self.link_layers.get(obj.objectIdentifier, None)
             if _debug:
