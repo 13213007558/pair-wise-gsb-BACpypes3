@@ -128,6 +128,7 @@ from .basetypes import (
     LoggingType,
     LogMultipleRecord,
     LogRecord,
+    LogStatus,
     Maintenance,
     MACAddress,
     NameValue,
@@ -2826,6 +2827,7 @@ class TrendLogObject(Object):
     logBuffer: ListOf(LogRecord)
     recordCount: Unsigned
     totalRecordCount: Unsigned
+    logStatus: LogStatus
     loggingType: LoggingType
     alignIntervals: Boolean
     intervalOffset: Unsigned

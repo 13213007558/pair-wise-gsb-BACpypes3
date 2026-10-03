@@ -22,3 +22,4 @@ from . import event
 from . import fault
 from . import networkport
 from . import schedule
+from . import trend

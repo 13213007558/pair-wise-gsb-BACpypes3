@@ -2828,6 +2828,7 @@ class PropertyIdentifier(Enumerated):
     linkSpeed = 420
     linkSpeedAutonegotiate = 422
     linkSpeeds = 421
+    logStatus = 153
     listOfGroupMembers = 53
     listOfObjectPropertyReferences = 54
     listOfSessionKeys = 55
